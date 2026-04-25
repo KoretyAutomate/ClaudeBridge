@@ -1,0 +1,48 @@
+# ClaudeBridge config — copy to config.yaml and edit for your projects.
+#
+# install.sh bootstraps this on first run if config.yaml is missing.
+
+default_scope: idea
+default_model: sonnet
+daily_cost_cap_usd: 20.0
+max_budget_usd_per_call: 2.0
+timeout_secs: 600
+global_subprocess_cap: 3
+
+# Scopes that NEVER auto-stick — explicit prefix required every time.
+# Use for sensitive scopes where accidentally routing personal content
+# (a podcast script, a finance question) into the wrong session would matter.
+# Empty list disables the feature.
+never_sticky: ["finance"]
+
+# Each prefix maps `/<name>` to a project working directory, model, and
+# whitelist of tools. Anything not listed is implicitly denied.
+prefixes:
+
+  # The default ideation scratchpad — unprefixed messages route here.
+  # Full tools so you can capture, edit, and run quick scripts.
+  idea:
+    cwd: /home/YOUR_USER/Project/_ideas
+    model: sonnet
+    allowed_tools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"]
+
+  # A normal development scope.
+  myproject:
+    cwd: /home/YOUR_USER/Project/MyProject
+    model: sonnet
+    allowed_tools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"]
+
+  # A glass-case scope: read-only. No shell. Prevents accidental mutation
+  # in a sensitive area (live trading code, signed configs, etc.).
+  finance:
+    cwd: /home/YOUR_USER/Project/Finance
+    model: sonnet
+    allowed_tools: ["Read", "Glob", "Grep"]
+
+verbs:
+  "/help": "show help"
+  "/list": "list prefixes"
+  "/status": "active sessions and cost"
+  "/new": "reset current scope thread"
+  "/reset": "alias for /new"
+  "/scaffold": "create new project"

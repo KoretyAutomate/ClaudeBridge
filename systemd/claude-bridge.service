@@ -1,0 +1,30 @@
+[Unit]
+Description=ClaudeBridge — Telegram dispatcher to claude -p
+Wants=network-online.target nss-lookup.target
+After=network-online.target nss-lookup.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Project/ClaudeBridge
+ExecStart=%h/miniconda3/envs/claude_bridge/bin/python %h/Project/ClaudeBridge/bridge.py
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=78
+KillSignal=SIGINT
+TimeoutStopSec=30
+LimitCORE=0
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=%h/Project %h/.claude %h/.claude_bridge %h/.cache
+ProtectHome=read-only
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=default.target

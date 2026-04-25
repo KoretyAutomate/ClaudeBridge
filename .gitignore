@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Local config (committed copy is config.example.yaml)
+config.yaml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Test results (generated, large, per global rule kept locally)
+test_results/
+
+# Local artifacts
+*.log
+.DS_Store
+.claude/
+*.jsonl
