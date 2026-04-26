@@ -4,6 +4,10 @@
 # Local config (committed copy is config.example.yaml)
 config.yaml
 
+# Working / design docs kept locally but not published
+PLAN.md
+CLAUDE.md
+
 # Python
 __pycache__/
 *.pyc

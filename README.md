@@ -25,8 +25,10 @@ Telegram cloud  ◄── outbound long-poll only ──┐
                                   ├─ /prefix → cwd  (per project)
                                   ├─ chat × scope → session UUID  (SQLite)
                                   └─ subprocess: claude -p
-                                                  --session-id <uuid>
                                                   --resume <uuid>
+                                                    (or fresh on first call;
+                                                     UUID captured from JSON
+                                                     output for later resume)
                                                   --allowed-tools <whitelist>
                                                   --disallowed-tools <denylist>
                                                   --max-budget-usd 2
@@ -101,6 +103,26 @@ Use `["Read", "Glob", "Grep"]` for a "glass case" scope (read-only, no shell, no
 | `unprefixed text` | Routes to your sticky scope, or the default if none |
 | `/new` | Reset the current scope's thread |
 | `/scaffold NewName` | Create `~/Project/NewName/` with read-only allowed tools, register prefix |
+
+## Routing & sessions
+
+Each incoming message resolves in this order:
+
+1. Non-text (photos, stickers, voice notes) → reply "text only" and drop.
+2. `/<verb>` (`/help`, `/list`, `/status`, `/new`, `/scaffold`) → handled in-process, no Claude call.
+3. `/<prefix>` from `config.yaml`:
+   - bare `/<prefix>` → switch sticky scope, no Claude call
+   - `/<prefix> body` → run `body` in that scope's `cwd`
+4. `/<unknown>` → reply with help, no Claude call (don't burn budget on typos).
+5. Unprefixed text → run in the chat's sticky scope (within 24h of last explicit prefix), else `default_scope`.
+
+Sessions are stored as `(chat_id, scope) → session_uuid` in `~/.claude_bridge/sessions.db`. First message in a (chat × scope) pair spawns Claude fresh and captures the assigned `session_id` from the JSON output; subsequent messages use `--resume <uuid>`. If the resume target is gone (e.g. `~/.claude/` was cleaned), the bridge archives the dead UUID, retries fresh, and tells you in chat.
+
+Scopes listed in `never_sticky` (`config.yaml`) always require an explicit prefix — useful for sensitive scopes where accidental routing of unrelated content would be a problem.
+
+`/scaffold <Name>` validates the name against `^[a-zA-Z0-9_-]{1,32}$`, creates `~/Project/<Name>/` with a starter `CLAUDE.md`, and registers it as a read-only prefix in `config.yaml` (you can manually promote it to grant `Edit`/`Write`/`Bash` later, then restart the service).
+
+Long replies that contain markdown tables are reformatted as one bold-label "card" per row, separated by `———` — much easier to read on a phone than a wrapped fixed-width table.
 
 ## Security model
 
