@@ -6,6 +6,7 @@ Single-user. See PLAN.md for architecture, security model, and decisions.
 from __future__ import annotations
 
 import asyncio
+import html
 import io
 import json
 import logging
@@ -132,6 +133,7 @@ def init_db() -> sqlite3.Connection:
                 chat_id      INTEGER NOT NULL,
                 scope        TEXT    NOT NULL,
                 session_uuid TEXT    NOT NULL,
+                used_count   INTEGER NOT NULL DEFAULT 0,
                 updated_at   TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
                 PRIMARY KEY (chat_id, scope)
             );
@@ -150,6 +152,13 @@ def init_db() -> sqlite3.Connection:
             );
             """
         )
+        # Migration: add used_count to existing sessions table if missing.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "used_count" not in cols:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0"
+            )
+            log.info("db.migrated added=used_count")
         conn.commit()
         return conn
     except sqlite3.DatabaseError as e:
@@ -241,20 +250,53 @@ def update_sticky(conn: sqlite3.Connection, chat_id: int, scope: str) -> None:
 
 # ============================== Sessions ==============================
 
-def get_or_create_uuid(conn: sqlite3.Connection, chat_id: int, scope: str) -> str:
+def get_existing_uuid(
+    conn: sqlite3.Connection, chat_id: int, scope: str,
+) -> str | None:
+    """Return the session UUID for (chat × scope) if one has been used at
+    least once with claude -p. Otherwise None — caller spawns without any
+    session flag and captures the assigned session_id from the JSON output.
+
+    In v2.1.119, `--session-id` is a fork-only flag and cannot be used to
+    mint a session with our own UUID. So Claude assigns the UUID; we just
+    record it after the first successful call.
+    """
     row = conn.execute(
-        "SELECT session_uuid FROM sessions WHERE chat_id=? AND scope=?",
+        "SELECT session_uuid FROM sessions "
+        "WHERE chat_id=? AND scope=? AND used_count > 0",
         (chat_id, scope),
     ).fetchone()
-    if row:
-        return row[0]
-    new_uuid = str(uuid_mod.uuid4())
+    return row[0] if row else None
+
+
+def upsert_session(
+    conn: sqlite3.Connection, chat_id: int, scope: str, session_uuid: str,
+) -> None:
+    """Insert or update the (chat × scope) session record, bumping used_count."""
     conn.execute(
-        "INSERT INTO sessions (chat_id, scope, session_uuid) VALUES (?, ?, ?)",
-        (chat_id, scope, new_uuid),
+        "INSERT INTO sessions (chat_id, scope, session_uuid, used_count, updated_at) "
+        "VALUES (?, ?, ?, 1, ?) "
+        "ON CONFLICT(chat_id, scope) DO UPDATE SET "
+        "session_uuid = excluded.session_uuid, "
+        "used_count = used_count + 1, "
+        "updated_at = excluded.updated_at",
+        (chat_id, scope, session_uuid, datetime.utcnow().isoformat()),
     )
     conn.commit()
-    return new_uuid
+
+
+def archive_uuid(
+    conn: sqlite3.Connection, chat_id: int, scope: str, session_uuid: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO sessions_archive (chat_id, scope, session_uuid) "
+        "VALUES (?, ?, ?)",
+        (chat_id, scope, session_uuid),
+    )
+    conn.execute(
+        "DELETE FROM sessions WHERE chat_id=? AND scope=?", (chat_id, scope),
+    )
+    conn.commit()
 
 
 def reset_session(conn: sqlite3.Connection, chat_id: int, scope: str) -> str:
@@ -269,10 +311,11 @@ def reset_session(conn: sqlite3.Connection, chat_id: int, scope: str) -> str:
         )
     new_uuid = str(uuid_mod.uuid4())
     conn.execute(
-        "INSERT INTO sessions (chat_id, scope, session_uuid, updated_at) "
-        "VALUES (?, ?, ?, ?) "
+        "INSERT INTO sessions (chat_id, scope, session_uuid, used_count, updated_at) "
+        "VALUES (?, ?, ?, 0, ?) "
         "ON CONFLICT(chat_id, scope) DO UPDATE SET "
         "session_uuid = excluded.session_uuid, "
+        "used_count = 0, "
         "updated_at = excluded.updated_at",
         (chat_id, scope, new_uuid, datetime.utcnow().isoformat()),
     )
@@ -302,26 +345,28 @@ def add_cost(conn: sqlite3.Connection, amount: float) -> None:
 
 # ============================== Subprocess ==============================
 
-async def run_claude(
+async def _spawn_claude(
     scope: str, scope_cfg: dict, prompt: str,
-    session_uuid: str, timeout_secs: int,
+    session_flags: list[str], timeout_secs: int,
 ) -> tuple[dict | None, str | None]:
     bin_path = os.environ.get("CLAUDE_BIN", str(HOME / ".local/bin/claude"))
     argv = [
         bin_path, "-p",
-        "--session-id", session_uuid,
-        "--resume", session_uuid,
+        *session_flags,
         "--output-format", "json",
         "--permission-mode", "bypassPermissions",
         "--max-budget-usd", str(CFG.get("max_budget_usd_per_call", 2.0)),
         "--allowed-tools", ",".join(scope_cfg["allowed_tools"]),
         "--disallowed-tools", ",".join(EXTRA_DISALLOWED_TOOLS),
         "--model", scope_cfg.get("model", CFG.get("default_model", "sonnet")),
-        prompt,
+        # `--` terminates flag parsing so a prompt starting with `--` (e.g.
+        # the user typed `--resume foo`) is treated as a positional.
+        "--", prompt,
     ]
     log.info(
-        "claude.spawn scope=%s cwd=%s tools=%s model=%s",
+        "claude.spawn scope=%s cwd=%s session=%s tools=%s model=%s",
         scope, scope_cfg["cwd"],
+        " ".join(session_flags) or "(fresh)",
         ",".join(scope_cfg["allowed_tools"]),
         scope_cfg.get("model", CFG.get("default_model")),
     )
@@ -341,26 +386,202 @@ async def run_claude(
         log.warning("claude.timeout scope=%s", scope)
         return None, f"timeout after {timeout_secs}s"
 
-    stderr = stderr_b.decode("utf-8", errors="replace")[:300].strip()
+    stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
+    stderr = stderr_b.decode("utf-8", errors="replace")[:500].strip()
     if proc.returncode != 0:
         log.warning(
-            "claude.nonzero scope=%s rc=%s stderr=%s",
-            scope, proc.returncode, stderr,
+            "claude.nonzero scope=%s rc=%s stderr=%r stdout=%r",
+            scope, proc.returncode, stderr, stdout_text[:500],
         )
-        return None, f"claude exited {proc.returncode}: {stderr or '(no stderr)'}"
+        # Some Claude failure paths put diagnostic output on stdout (e.g.,
+        # JSON results with is_error=true). Surface whichever we got.
+        detail = stderr or stdout_text[:500] or "(no output on stderr or stdout)"
+        return None, f"claude exited {proc.returncode}: {detail}"
 
     try:
-        data = json.loads(stdout_b.decode("utf-8", errors="replace"))
+        data = json.loads(stdout_text)
     except json.JSONDecodeError:
-        return None, f"claude returned non-JSON output (stderr: {stderr or 'none'})"
+        return None, (
+            f"claude returned non-JSON output. stdout[:200]={stdout_text[:200]!r} "
+            f"stderr={stderr or 'none'}"
+        )
     return data, None
+
+
+def _is_resume_failure(err: str) -> bool:
+    """Heuristic: did `--resume <uuid>` fail because the session is gone?"""
+    if not err:
+        return False
+    e = err.lower()
+    return any(s in e for s in (
+        "session not found", "no such session", "could not find session",
+        "session does not exist", "invalid session",
+    ))
+
+
+async def run_claude_smart(
+    conn: sqlite3.Connection, scope: str, scope_cfg: dict, prompt: str,
+    chat_id: int, timeout_secs: int,
+) -> tuple[dict | None, str | None, bool]:
+    """Run claude -p with auto resume-or-fresh logic.
+
+    Returns (data, err, archived_stale). `archived_stale` is True when a
+    stored UUID was found dead and a fresh session was started in its place.
+    """
+    existing = get_existing_uuid(conn, chat_id, scope)
+
+    # Try resume first if we have one.
+    if existing:
+        data, err = await _spawn_claude(
+            scope, scope_cfg, prompt, ["--resume", existing], timeout_secs,
+        )
+        if err is None:
+            return data, None, False
+        if not _is_resume_failure(err):
+            # Real failure — surface it; don't silently retry.
+            return None, err, False
+        # Resume target is gone — archive and fall through to fresh.
+        log.warning(
+            "resume.stale chat=%s scope=%s uuid=%s — archiving and starting fresh",
+            chat_id, scope, existing,
+        )
+        archive_uuid(conn, chat_id, scope, existing)
+
+    # Fresh session — no session flag.
+    data, err = await _spawn_claude(
+        scope, scope_cfg, prompt, [], timeout_secs,
+    )
+    return data, err, existing is not None
 
 
 # ============================== Telegram I/O ==============================
 
+_TABLE_SEP_CHARS = set("|-: \t")
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_CODE_RE = re.compile(r"`(.+?)`")
+
+
+def _is_table_separator(line: str) -> bool:
+    """True if line looks like a markdown table separator (|---|---|)."""
+    s = line.strip()
+    if not s or "|" not in s or "-" not in s:
+        return False
+    return all(c in _TABLE_SEP_CHARS for c in s)
+
+
+def _has_markdown_tables(text: str) -> bool:
+    lines = text.split("\n")
+    for i in range(len(lines) - 1):
+        if "|" in lines[i] and _is_table_separator(lines[i + 1]):
+            return True
+    return False
+
+
+def _md_inline_to_html(s: str) -> str:
+    """HTML-escape, then convert basic inline markdown (`**bold**`, ``code``)."""
+    s = html.escape(s)
+    s = _MD_BOLD_RE.sub(r"<b>\1</b>", s)
+    s = _MD_CODE_RE.sub(r"<code>\1</code>", s)
+    return s
+
+
+def _split_table_row(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _format_table_as_cards(table_lines: list[str]) -> str:
+    """Render a markdown table as one bold-label "card" per data row.
+
+    Phone screens are vertical and narrow; column-aligned tables wrap badly
+    even in monospace. Cards put each row on its own block with `Header:
+    value` lines that read top-to-bottom.
+    """
+    # Need at least header + separator + one data row.
+    if len(table_lines) < 3:
+        return "<pre>" + html.escape("\n".join(table_lines)) + "</pre>"
+
+    headers = _split_table_row(table_lines[0])
+    data_rows = [_split_table_row(ln) for ln in table_lines[2:]]
+
+    cards: list[str] = []
+    for row in data_rows:
+        if not any(cell for cell in row):
+            continue
+        card_lines = []
+        for h, cell in zip(headers, row):
+            label = html.escape(h.strip().strip("*").strip())
+            value = _md_inline_to_html(cell) if cell else "—"
+            card_lines.append(f"<b>{label}</b>: {value}")
+        cards.append("\n".join(card_lines))
+
+    if not cards:
+        return "<pre>" + html.escape("\n".join(table_lines)) + "</pre>"
+    return "\n\n———\n\n".join(cards)
+
+
+def _format_for_telegram_html(text: str) -> str:
+    """Convert text with markdown tables to Telegram-safe HTML.
+
+    Tables become "card" blocks with bold headers. Inline `**bold**` and
+    `` `code` `` are converted. Everything else is HTML-escaped. Output is
+    intended for `parse_mode="HTML"`.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    text_buf: list[str] = []
+
+    def flush_text() -> None:
+        if text_buf:
+            out.append(_md_inline_to_html("\n".join(text_buf)))
+            text_buf.clear()
+
+    i = 0
+    while i < len(lines):
+        if (
+            "|" in lines[i]
+            and i + 1 < len(lines)
+            and _is_table_separator(lines[i + 1])
+        ):
+            flush_text()
+            table_lines = [lines[i], lines[i + 1]]
+            j = i + 2
+            while j < len(lines) and "|" in lines[j]:
+                table_lines.append(lines[j])
+                j += 1
+            out.append(_format_table_as_cards(table_lines))
+            i = j
+        else:
+            text_buf.append(lines[i])
+            i += 1
+    flush_text()
+    return "\n".join(out)
+
+
 async def reply_long(update: Update, text: str) -> None:
     if not text:
         text = "(empty reply)"
+
+    # Has-tables path: wrap tables in <pre> for monospace alignment.
+    if _has_markdown_tables(text):
+        formatted = _format_for_telegram_html(text)
+        if len(formatted) <= TG_CHUNK:
+            await update.message.reply_text(formatted, parse_mode="HTML")
+            return
+        # Long tabular reply — splitting HTML safely is fiddly; attach instead.
+        await update.message.reply_text(
+            "Reply has tables and is long — attaching full markdown as file."
+        )
+        bio = io.BytesIO(text.encode("utf-8"))
+        bio.name = "reply.md"
+        await update.message.reply_document(bio)
+        return
+
+    # No tables — plain text, original chunking.
     if len(text) <= TG_CHUNK:
         await update.message.reply_text(text)
         return
@@ -542,7 +763,6 @@ async def dispatch(
         )
         return
 
-    session_uuid = get_or_create_uuid(conn, chat_id, token)
     timeout_secs = int(
         os.environ.get("BRIDGE_TIMEOUT_SECS", CFG.get("timeout_secs", 600))
     )
@@ -553,43 +773,26 @@ async def dispatch(
             await update.message.chat.send_action("typing")
         except Exception:
             pass
-        data, err = await run_claude(
-            token, scope_cfg, body or "", session_uuid, timeout_secs,
+        data, err, archived_stale = await run_claude_smart(
+            conn, token, scope_cfg, body or "", chat_id, timeout_secs,
         )
 
     if err:
         await update.message.reply_text(f"❌ {err}")
         return
 
-    returned_id = data.get("session_id") if isinstance(data, dict) else None
-    if returned_id and returned_id != session_uuid:
-        log.warning(
-            "session.mismatch passed=%s got=%s scope=%s",
-            session_uuid, returned_id, token,
-        )
-        conn.execute(
-            "INSERT INTO sessions_archive (chat_id, scope, session_uuid) VALUES (?, ?, ?)",
-            (chat_id, token, session_uuid),
-        )
-        conn.execute(
-            "UPDATE sessions SET session_uuid=?, updated_at=? "
-            "WHERE chat_id=? AND scope=?",
-            (returned_id, datetime.utcnow().isoformat(), chat_id, token),
-        )
-        conn.commit()
+    if archived_stale:
         await update.message.reply_text(
-            "(Previous thread archived; starting fresh in /" + token + ".)"
+            f"(Previous thread for /{token} was gone; starting fresh.)"
         )
+
+    returned_id = data.get("session_id") if isinstance(data, dict) else None
+    if returned_id:
+        upsert_session(conn, chat_id, token, returned_id)
 
     cost = float(data.get("total_cost_usd", 0.0) or 0.0)
     if cost > 0:
         add_cost(conn, cost)
-
-    conn.execute(
-        "UPDATE sessions SET updated_at=? WHERE chat_id=? AND scope=?",
-        (datetime.utcnow().isoformat(), chat_id, token),
-    )
-    conn.commit()
 
     result = data.get("result", "") if isinstance(data, dict) else ""
     await reply_long(update, result)

@@ -54,7 +54,10 @@ cd ~/Project/ClaudeBridge
 bash scripts/install.sh
 # script exits asking you to fill .env
 
-# 3. Edit .env with your bot token and numeric Telegram user ID
+# 3. Edit .env with your bot token, Telegram user ID, and (if you use OAuth)
+#    CLAUDE_CODE_OAUTH_TOKEN. systemd-user services don't inherit your
+#    interactive shell's env, so OAuth auth needs the token in .env explicitly
+#    or claude -p subprocesses get HTTP 401.
 ${EDITOR:-nano} .env
 
 # 4. Edit config.yaml — set your project prefixes, cwds, models, allowed_tools

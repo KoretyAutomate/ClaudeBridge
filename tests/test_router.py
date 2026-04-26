@@ -39,6 +39,7 @@ def _conn() -> sqlite3.Connection:
     c.executescript("""
         CREATE TABLE sessions (
             chat_id INTEGER, scope TEXT, session_uuid TEXT,
+            used_count INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT, PRIMARY KEY (chat_id, scope)
         );
         CREATE TABLE chat_state (
@@ -141,31 +142,126 @@ class TestSessions(unittest.TestCase):
         _setup_cfg()
         self.conn = _conn()
 
-    def test_get_or_create_creates_then_returns_same(self) -> None:
-        u1 = bridge.get_or_create_uuid(self.conn, 42, "podcast")
-        u2 = bridge.get_or_create_uuid(self.conn, 42, "podcast")
-        self.assertEqual(u1, u2)
-        self.assertEqual(len(u1), 36)
+    def test_get_existing_returns_none_when_unused(self) -> None:
+        # No row at all.
+        self.assertIsNone(bridge.get_existing_uuid(self.conn, 42, "podcast"))
+        # Row with used_count=0 (e.g. just-migrated stale entry) is also None.
+        self.conn.execute(
+            "INSERT INTO sessions (chat_id, scope, session_uuid, used_count) "
+            "VALUES (42, 'podcast', 'stale-uuid', 0)"
+        )
+        self.assertIsNone(bridge.get_existing_uuid(self.conn, 42, "podcast"))
+
+    def test_upsert_session_then_get_existing(self) -> None:
+        bridge.upsert_session(self.conn, 42, "podcast", "uuid-from-claude")
+        self.assertEqual(
+            "uuid-from-claude",
+            bridge.get_existing_uuid(self.conn, 42, "podcast"),
+        )
+        # Second upsert with a new uuid replaces and bumps used_count.
+        bridge.upsert_session(self.conn, 42, "podcast", "new-uuid")
+        self.assertEqual(
+            "new-uuid",
+            bridge.get_existing_uuid(self.conn, 42, "podcast"),
+        )
+        used = self.conn.execute(
+            "SELECT used_count FROM sessions WHERE chat_id=42 AND scope='podcast'"
+        ).fetchone()[0]
+        self.assertEqual(2, used)
 
     def test_per_chat_per_scope_isolated(self) -> None:
-        a = bridge.get_or_create_uuid(self.conn, 42, "podcast")
-        b = bridge.get_or_create_uuid(self.conn, 42, "trading")
-        self.assertNotEqual(a, b)
+        bridge.upsert_session(self.conn, 42, "podcast", "u-podcast")
+        bridge.upsert_session(self.conn, 42, "trading", "u-trading")
+        self.assertEqual("u-podcast",
+                         bridge.get_existing_uuid(self.conn, 42, "podcast"))
+        self.assertEqual("u-trading",
+                         bridge.get_existing_uuid(self.conn, 42, "trading"))
 
-    def test_reset_archives_old(self) -> None:
-        old = bridge.get_or_create_uuid(self.conn, 42, "podcast")
-        new = bridge.reset_session(self.conn, 42, "podcast")
-        self.assertNotEqual(old, new)
+    def test_archive_uuid_deletes_active_row(self) -> None:
+        bridge.upsert_session(self.conn, 42, "podcast", "u1")
+        bridge.archive_uuid(self.conn, 42, "podcast", "u1")
+        self.assertIsNone(bridge.get_existing_uuid(self.conn, 42, "podcast"))
         archived = self.conn.execute(
             "SELECT session_uuid FROM sessions_archive WHERE chat_id=42"
         ).fetchone()
-        self.assertEqual(archived[0], old)
+        self.assertEqual("u1", archived[0])
+
+    def test_resume_failure_heuristic(self) -> None:
+        self.assertTrue(bridge._is_resume_failure(
+            "claude exited 1: Error: session not found"
+        ))
+        self.assertTrue(bridge._is_resume_failure(
+            "could not find session 'xyz'"
+        ))
+        self.assertFalse(bridge._is_resume_failure(
+            "claude exited 1: Error: rate limited"
+        ))
+        self.assertFalse(bridge._is_resume_failure(""))
 
     def test_daily_cost_accumulates(self) -> None:
         self.assertEqual(0.0, bridge.todays_cost(self.conn))
         bridge.add_cost(self.conn, 0.50)
         bridge.add_cost(self.conn, 0.75)
         self.assertAlmostEqual(1.25, bridge.todays_cost(self.conn))
+
+
+class TestTableFormatter(unittest.TestCase):
+
+    def test_separator_detection(self) -> None:
+        self.assertTrue(bridge._is_table_separator("|---|---|"))
+        self.assertTrue(bridge._is_table_separator("| --- | :---: | ---: |"))
+        self.assertFalse(bridge._is_table_separator("---"))  # no pipe
+        self.assertFalse(bridge._is_table_separator("| Cell | Cell |"))  # no dash
+        self.assertFalse(bridge._is_table_separator(""))
+
+    def test_has_tables_positive(self) -> None:
+        text = "Intro\n\n| H1 | H2 |\n|---|---|\n| a | b |\n\nOutro"
+        self.assertTrue(bridge._has_markdown_tables(text))
+
+    def test_has_tables_negative(self) -> None:
+        self.assertFalse(bridge._has_markdown_tables("just plain text"))
+        self.assertFalse(bridge._has_markdown_tables("---\nh-rule\n---"))
+
+    def test_format_renders_table_as_cards(self) -> None:
+        text = "Before\n\n| Option | Notes |\n|---|---|\n| A | foo |\n| B | bar |\n\nAfter"
+        out = bridge._format_for_telegram_html(text)
+        self.assertIn("Before", out)
+        self.assertIn("After", out)
+        # Card format: bold header label : value.
+        self.assertIn("<b>Option</b>: A", out)
+        self.assertIn("<b>Notes</b>: foo", out)
+        self.assertIn("<b>Option</b>: B", out)
+        self.assertIn("<b>Notes</b>: bar", out)
+        # Cards are separated by a horizontal rule.
+        self.assertIn("———", out)
+
+    def test_format_strips_bold_from_header_labels(self) -> None:
+        text = "| **Option** | **Notes** |\n|---|---|\n| A | foo |"
+        out = bridge._format_for_telegram_html(text)
+        self.assertIn("<b>Option</b>: A", out)
+        self.assertNotIn("<b><b>", out)  # no nested bold
+
+    def test_format_renders_inline_bold_in_cells(self) -> None:
+        text = "| Option | Notes |\n|---|---|\n| **strong** | plain |"
+        out = bridge._format_for_telegram_html(text)
+        self.assertIn("<b>Option</b>: <b>strong</b>", out)
+
+    def test_format_html_escapes_inside_table(self) -> None:
+        text = "| Cmd | Effect |\n|---|---|\n| code | <x> |"
+        out = bridge._format_for_telegram_html(text)
+        # Literal `<x>` must be escaped so Telegram does not parse it as HTML.
+        self.assertIn("&lt;x&gt;", out)
+
+    def test_format_html_escapes_outside_table(self) -> None:
+        text = "Has <script> and & ampersand"
+        out = bridge._format_for_telegram_html(text)
+        self.assertNotIn("<script>", out)
+        self.assertIn("&lt;script&gt;", out)
+        self.assertIn("&amp;", out)
+
+    def test_format_handles_no_tables(self) -> None:
+        out = bridge._format_for_telegram_html("just plain text")
+        self.assertEqual(out, "just plain text")
 
 
 if __name__ == "__main__":
