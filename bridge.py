@@ -27,7 +27,7 @@ from telegram import Update
 from telegram.constants import ChatType
 from telegram.error import Conflict
 from telegram.ext import (
-    Application, ContextTypes, MessageHandler, filters,
+    Application, ContextTypes, MessageHandler, TypeHandler, filters,
 )
 
 HOME = Path.home()
@@ -860,6 +860,67 @@ async def dispatch(
     await reply_long(update, result)
 
 
+async def log_inbound_update(
+    update: object, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Log every update before any filter or authz can discard it.
+
+    Runs in handler group -1, so it sees updates the main handler never
+    gets (edits, non-text, wrong chat). Without this, "the bridge received
+    nothing" and "the bridge silently dropped it" look identical in the log,
+    which is the whole difficulty in debugging a missing reply. Never raises
+    and never replies — logging only.
+    """
+    try:
+        if not isinstance(update, Update):
+            log.info("inbound.update kind=non-update repr=%.80s", repr(update))
+            return
+        msg = update.message or update.edited_message
+        kind = "message" if update.message else (
+            "edited_message" if update.edited_message else "other"
+        )
+        chat = msg.chat.id if msg and msg.chat else None
+        user = msg.from_user.id if msg and msg.from_user else None
+        age = message_age_secs(msg.date) if msg else None
+        text = (msg.text or "") if msg else ""
+        log.info(
+            "inbound.update id=%s kind=%s chat=%s user=%s age=%s len=%d text=%.60r",
+            update.update_id, kind, chat, user,
+            f"{int(age)}s" if age is not None else "?",
+            len(text), text,
+        )
+    except Exception as e:  # never let diagnostics break dispatch
+        log.warning("inbound.log_failed: %s: %s", type(e).__name__, e)
+
+
+async def handle_edited_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Tell the user an edit was ignored instead of silently dropping it.
+
+    Editing a sent message is a natural way to "fix and resend" a request,
+    but an edit is a different update type and was never acted on — with no
+    feedback at all. Say so, so the user knows to send a new message.
+    """
+    if update.edited_message is None:
+        return
+    msg = update.edited_message
+    if (
+        msg.chat is None or msg.from_user is None
+        or msg.chat.type != ChatType.PRIVATE
+        or msg.from_user.id not in ALLOWED_USER_IDS
+    ):
+        return
+    log.info(
+        "edited_message.ignored chat=%s len=%d",
+        msg.chat.id, len(msg.text or ""),
+    )
+    await msg.reply_text(
+        "✏️ Edits aren't processed — I only act on newly sent messages. "
+        "Send it as a new message."
+    )
+
+
 def message_age_secs(sent_at: datetime | None) -> float | None:
     """Seconds since a Telegram message was sent, or None if undeterminable.
 
@@ -1007,10 +1068,19 @@ def main() -> None:
     )
     app.bot_data["conn"] = conn
 
+    # Group -1 runs first and logs every update, including ones the
+    # chokepoint below discards. Diagnostics only — never replies.
+    app.add_handler(TypeHandler(Update, log_inbound_update), group=-1)
+
     # Single chokepoint: private text only, never edited messages.
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.UpdateType.EDITED_MESSAGE,
         handle_message,
+    ))
+    # Edits reach a handler that says "not processed" rather than vanishing.
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & filters.UpdateType.EDITED_MESSAGE,
+        handle_edited_message,
     ))
     app.add_error_handler(telegram_error_handler)
 
@@ -1020,7 +1090,9 @@ def main() -> None:
         # async approval reply looks exactly like "Telegram is broken".
         # handle_message rejects the ones too old to act on.
         drop_pending_updates=False,
-        allowed_updates=["message"],
+        # edited_message must be fetched for the edit handler to see it at
+        # all; without it Telegram never delivers edits and they vanish.
+        allowed_updates=["message", "edited_message"],
     )
 
 
