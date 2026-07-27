@@ -54,6 +54,13 @@ NEVER_STICKY: set[str] = set()
 # conversation was about instead of the current one. 0 disables expiry.
 SESSION_TTL_SECS: int = 43200  # 12h
 
+# Upper bound on how late a queued message may still be acted on. Updates
+# sent while the bridge was down are delivered on startup rather than
+# dropped, but a long outage must not replay a stale backlog — an "approve"
+# from hours ago may no longer refer to the current draft. 0 disables the
+# guard (act on everything).
+MAX_MESSAGE_AGE_SECS: int = 900  # 15min
+
 # Global deny patterns applied on every claude -p call. Stacks on top of
 # whatever is in ~/.claude/settings.json (deny > ask > allow precedence).
 EXTRA_DISALLOWED_TOOLS = [
@@ -86,16 +93,21 @@ def setup_logging() -> None:
 
 
 def load_yaml_config() -> None:
-    global CFG, NEVER_STICKY, SESSION_TTL_SECS
+    global CFG, NEVER_STICKY, SESSION_TTL_SECS, MAX_MESSAGE_AGE_SECS
     with open(CONFIG_PATH) as f:
         CFG = yaml.safe_load(f)
     NEVER_STICKY = set(CFG.get("never_sticky", []))
     SESSION_TTL_SECS = int(CFG.get("session_ttl_secs", SESSION_TTL_SECS))
+    MAX_MESSAGE_AGE_SECS = int(
+        CFG.get("max_message_age_secs", MAX_MESSAGE_AGE_SECS)
+    )
     log.info(
-        "config.loaded prefixes=%s never_sticky=%s session_ttl_secs=%s",
+        "config.loaded prefixes=%s never_sticky=%s session_ttl_secs=%s "
+        "max_message_age_secs=%s",
         list(CFG.get("prefixes", {}).keys()),
         sorted(NEVER_STICKY),
         SESSION_TTL_SECS,
+        MAX_MESSAGE_AGE_SECS,
     )
 
 
@@ -848,6 +860,18 @@ async def dispatch(
     await reply_long(update, result)
 
 
+def message_age_secs(sent_at: datetime | None) -> float | None:
+    """Seconds since a Telegram message was sent, or None if undeterminable.
+
+    Telegram stamps message.date as timezone-aware UTC. Returns None rather
+    than guessing when the stamp is missing or naive, so callers treat the
+    message as current instead of rejecting it on a bad clock.
+    """
+    if sent_at is None or sent_at.tzinfo is None:
+        return None
+    return (datetime.now(sent_at.tzinfo) - sent_at).total_seconds()
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authz(update):
         log.info(
@@ -859,6 +883,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     text = update.message.text
     conn: sqlite3.Connection = context.application.bot_data["conn"]
+
+    # Queued-while-down messages are delivered rather than dropped, so reject
+    # the genuinely stale ones here instead of acting on a reply that may no
+    # longer refer to the current draft. Never silently: always say so.
+    age = message_age_secs(update.message.date)
+    if age is not None and MAX_MESSAGE_AGE_SECS > 0 and age > MAX_MESSAGE_AGE_SECS:
+        log.warning(
+            "message.stale chat=%s age=%ds max=%ds — not acted on",
+            chat_id, int(age), MAX_MESSAGE_AGE_SECS,
+        )
+        await update.message.reply_text(
+            f"⏱ Ignored — this message is {int(age // 60)}min old (the bridge "
+            f"was down when you sent it). Resend it if it still applies."
+        )
+        return
 
     lock = PER_CHAT_LOCKS.setdefault(chat_id, asyncio.Lock())
     if lock.locked():
@@ -976,7 +1015,11 @@ def main() -> None:
     app.add_error_handler(telegram_error_handler)
 
     app.run_polling(
-        drop_pending_updates=True,
+        # Keep updates queued during downtime — a restart used to silently
+        # eat any message sent while the bridge was stopped, which for an
+        # async approval reply looks exactly like "Telegram is broken".
+        # handle_message rejects the ones too old to act on.
+        drop_pending_updates=False,
         allowed_updates=["message"],
     )
 

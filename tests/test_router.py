@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -232,6 +232,20 @@ class TestSessions(unittest.TestCase):
         self.assertFalse(
             bridge.is_session_stale(self.conn, 42, "thincart", 43200)
         )
+
+    def test_message_age_fresh_and_stale(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.assertLess(bridge.message_age_secs(now), 5)
+        old = now - timedelta(seconds=3600)
+        self.assertAlmostEqual(
+            3600, bridge.message_age_secs(old), delta=5
+        )
+
+    def test_message_age_none_when_undeterminable(self) -> None:
+        # Missing stamp, and naive stamp (no tzinfo) — both mean "treat as
+        # current" rather than reject on a bad clock.
+        self.assertIsNone(bridge.message_age_secs(None))
+        self.assertIsNone(bridge.message_age_secs(datetime.utcnow()))
 
     def test_resume_failure_heuristic(self) -> None:
         self.assertTrue(bridge._is_resume_failure(

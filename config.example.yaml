@@ -15,6 +15,12 @@ global_subprocess_cap: 3
 # 0 disables expiry. 12h.
 session_ttl_secs: 43200
 
+# Messages sent while the bridge was down are delivered on startup rather
+# than dropped (dropping them makes a restart look like "Telegram is
+# broken"). Anything older than this is refused with a note telling you to
+# resend, so a long outage cannot replay a stale backlog. 0 disables. 15min.
+max_message_age_secs: 900
+
 # Scopes that NEVER auto-stick — explicit prefix required every time.
 # Use for sensitive scopes where accidentally routing personal content
 # (a podcast script, a finance question) into the wrong session would matter.
