@@ -21,6 +21,12 @@ session_ttl_secs: 43200
 # resend, so a long outage cannot replay a stale backlog. 0 disables. 15min.
 max_message_age_secs: 900
 
+# A run can take minutes, and Telegram expires a "typing" indicator after
+# ~5s. It is refreshed for the whole run, and after this long a plain
+# "still working" message is sent too, because a multi-minute silence is
+# indistinguishable from a failure. 0 disables the message.
+long_run_notice_secs: 60
+
 # Scopes that NEVER auto-stick — explicit prefix required every time.
 # Use for sensitive scopes where accidentally routing personal content
 # (a podcast script, a finance question) into the wrong session would matter.

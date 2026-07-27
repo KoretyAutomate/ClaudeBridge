@@ -136,6 +136,45 @@ class TestRouter(unittest.TestCase):
         self.assertFalse(bridge.SCAFFOLD_NAME_RE.match("a" * 33))
 
 
+class TestFailureExplain(unittest.TestCase):
+    """A failed run must report why, not dump raw JSON at the user."""
+
+    def setUp(self) -> None:
+        _setup_cfg()
+        bridge.CFG["max_budget_usd_per_call"] = 2.0
+
+    def test_budget_cap_is_named_explicitly(self) -> None:
+        # Verbatim shape of the real 2026-07-26 era failure.
+        blob = (
+            '{"is_error":true,"duration_api_ms":155019,"num_turns":3,'
+            '"stop_reason":"tool_use","total_cost_usd":2.08628415}'
+        )
+        out = bridge.explain_failure_json(blob)
+        self.assertIsNotNone(out)
+        self.assertIn("budget cap", out)
+        self.assertIn("$2.09", out)
+        self.assertIn("max_budget_usd_per_call", out)
+
+    def test_cost_just_under_cap_still_counts_as_budget(self) -> None:
+        # Claude can stop a hair under the cap; don't misreport that.
+        blob = '{"is_error":true,"total_cost_usd":1.995,"num_turns":2}'
+        self.assertIn("budget cap", bridge.explain_failure_json(blob))
+
+    def test_non_budget_error_reports_its_own_detail(self) -> None:
+        blob = '{"is_error":true,"result":"tool denied","total_cost_usd":0.1}'
+        out = bridge.explain_failure_json(blob)
+        self.assertIn("tool denied", out)
+        self.assertNotIn("budget cap", out)
+
+    def test_returns_none_for_success_and_non_json(self) -> None:
+        self.assertIsNone(
+            bridge.explain_failure_json('{"is_error":false,"result":"ok"}')
+        )
+        self.assertIsNone(bridge.explain_failure_json("plain stderr text"))
+        self.assertIsNone(bridge.explain_failure_json("{not valid json"))
+        self.assertIsNone(bridge.explain_failure_json(""))
+
+
 class TestSessions(unittest.TestCase):
 
     def setUp(self) -> None:

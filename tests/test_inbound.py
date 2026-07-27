@@ -109,5 +109,77 @@ class TestInboundLogging(unittest.TestCase):
         self.assertTrue(any("non-update" in r for r in out), out)
 
 
+class _FakeChat:
+    def __init__(self, fail: bool = False) -> None:
+        self.actions = 0
+        self.fail = fail
+
+    async def send_action(self, action: str) -> None:
+        self.actions += 1
+        if self.fail:
+            raise RuntimeError("telegram transient")
+
+
+class _FakeMessage:
+    def __init__(self, fail: bool = False) -> None:
+        self.chat = _FakeChat(fail)
+        self.replies: list[str] = []
+
+    async def reply_text(self, text: str) -> None:
+        self.replies.append(text)
+
+
+class _FakeUpdate:
+    def __init__(self, fail: bool = False) -> None:
+        self.message = _FakeMessage(fail)
+
+
+class TestKeepalive(unittest.TestCase):
+    """The typing heartbeat must outlive a slow run and never break it."""
+
+    def setUp(self) -> None:
+        self._interval = bridge.KEEPALIVE_INTERVAL_SECS
+        self._notice = bridge.LONG_RUN_NOTICE_SECS
+        # Compress the real cadence so the test stays fast.
+        bridge.KEEPALIVE_INTERVAL_SECS = 0.01
+        bridge.LONG_RUN_NOTICE_SECS = 0.05
+
+    def tearDown(self) -> None:
+        bridge.KEEPALIVE_INTERVAL_SECS = self._interval
+        bridge.LONG_RUN_NOTICE_SECS = self._notice
+
+    def _run(self, upd: _FakeUpdate, for_secs: float) -> None:
+        async def go() -> None:
+            t = asyncio.create_task(bridge.keepalive(upd, 600))
+            await asyncio.sleep(for_secs)
+            t.cancel()
+            await t  # must return cleanly, not raise CancelledError out
+        asyncio.run(go())
+
+    def test_refreshes_typing_repeatedly(self) -> None:
+        upd = _FakeUpdate()
+        self._run(upd, 0.08)
+        # Single send would be 1; the whole point is that it keeps going.
+        self.assertGreater(upd.message.chat.actions, 2)
+
+    def test_sends_long_run_notice_once(self) -> None:
+        upd = _FakeUpdate()
+        self._run(upd, 0.2)
+        notices = [r for r in upd.message.replies if "Still working" in r]
+        self.assertEqual(1, len(notices), upd.message.replies)
+
+    def test_survives_send_action_failure(self) -> None:
+        # A transient Telegram error must not kill the heartbeat or the run.
+        upd = _FakeUpdate(fail=True)
+        self._run(upd, 0.05)
+        self.assertGreater(upd.message.chat.actions, 1)
+
+    def test_notice_disabled_when_zero(self) -> None:
+        bridge.LONG_RUN_NOTICE_SECS = 0
+        upd = _FakeUpdate()
+        self._run(upd, 0.1)
+        self.assertEqual([], upd.message.replies)
+
+
 if __name__ == "__main__":
     unittest.main()

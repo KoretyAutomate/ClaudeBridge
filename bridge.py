@@ -61,6 +61,13 @@ SESSION_TTL_SECS: int = 43200  # 12h
 # guard (act on everything).
 MAX_MESSAGE_AGE_SECS: int = 900  # 15min
 
+# Telegram expires a "typing" chat action after ~5s, so refresh it below
+# that while a run is in flight. After LONG_RUN_NOTICE_SECS also send one
+# real message: a multi-minute silence is indistinguishable from a failure.
+# 0 disables the notice (the typing refresh always runs).
+KEEPALIVE_INTERVAL_SECS: int = 4
+LONG_RUN_NOTICE_SECS: int = 60
+
 # Global deny patterns applied on every claude -p call. Stacks on top of
 # whatever is in ~/.claude/settings.json (deny > ask > allow precedence).
 EXTRA_DISALLOWED_TOOLS = [
@@ -94,6 +101,7 @@ def setup_logging() -> None:
 
 def load_yaml_config() -> None:
     global CFG, NEVER_STICKY, SESSION_TTL_SECS, MAX_MESSAGE_AGE_SECS
+    global LONG_RUN_NOTICE_SECS
     with open(CONFIG_PATH) as f:
         CFG = yaml.safe_load(f)
     NEVER_STICKY = set(CFG.get("never_sticky", []))
@@ -101,13 +109,17 @@ def load_yaml_config() -> None:
     MAX_MESSAGE_AGE_SECS = int(
         CFG.get("max_message_age_secs", MAX_MESSAGE_AGE_SECS)
     )
+    LONG_RUN_NOTICE_SECS = int(
+        CFG.get("long_run_notice_secs", LONG_RUN_NOTICE_SECS)
+    )
     log.info(
         "config.loaded prefixes=%s never_sticky=%s session_ttl_secs=%s "
-        "max_message_age_secs=%s",
+        "max_message_age_secs=%s long_run_notice_secs=%s",
         list(CFG.get("prefixes", {}).keys()),
         sorted(NEVER_STICKY),
         SESSION_TTL_SECS,
         MAX_MESSAGE_AGE_SECS,
+        LONG_RUN_NOTICE_SECS,
     )
 
 
@@ -437,7 +449,11 @@ async def _spawn_claude(
             scope, proc.returncode, stderr, stdout_text[:500],
         )
         # Some Claude failure paths put diagnostic output on stdout (e.g.,
-        # JSON results with is_error=true). Surface whichever we got.
+        # JSON results with is_error=true). Prefer a readable summary of that
+        # over dumping raw JSON at the user, who cannot act on it.
+        summary = explain_failure_json(stdout_text)
+        if summary:
+            return None, summary
         detail = stderr or stdout_text[:500] or "(no output on stderr or stdout)"
         return None, f"claude exited {proc.returncode}: {detail}"
 
@@ -449,6 +465,54 @@ async def _spawn_claude(
             f"stderr={stderr or 'none'}"
         )
     return data, None
+
+
+def explain_failure_json(stdout_text: str) -> str | None:
+    """Turn a claude JSON error result into something the user can act on.
+
+    A failed run prints a JSON result blob with is_error=true. Dumping 500
+    chars of that at the chat is unreadable and hides the one thing that
+    matters — usually that --max-budget-usd stopped it mid-task. Returns
+    None when stdout isn't such a blob, so the caller falls back to raw.
+    """
+    if not stdout_text.startswith("{"):
+        return None
+    try:
+        d = json.loads(stdout_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(d, dict) or not d.get("is_error"):
+        return None
+
+    cost = d.get("total_cost_usd")
+    cap = float(CFG.get("max_budget_usd_per_call", 2.0))
+    turns = d.get("num_turns")
+    secs = (d.get("duration_api_ms") or 0) / 1000
+
+    parts: list[str] = []
+    # Cost within a cent of the cap means the cap is what stopped it.
+    if isinstance(cost, (int, float)) and cost >= cap - 0.01:
+        parts.append(
+            f"hit the per-call budget cap (${cost:.2f} of ${cap:.2f}) and was "
+            f"stopped mid-task"
+        )
+        parts.append(
+            "raise max_budget_usd_per_call in config.yaml, or split the "
+            "request into smaller steps"
+        )
+    else:
+        detail = d.get("result") or d.get("error") or d.get("stop_reason")
+        parts.append(f"failed: {str(detail)[:200]}")
+        if isinstance(cost, (int, float)):
+            parts.append(f"cost ${cost:.2f}")
+
+    stats = []
+    if turns:
+        stats.append(f"{turns} turns")
+    if secs:
+        stats.append(f"{secs:.0f}s")
+    tail = f" ({', '.join(stats)})" if stats else ""
+    return " — ".join(parts) + tail
 
 
 def _is_resume_failure(err: str) -> bool:
@@ -826,13 +890,19 @@ async def dispatch(
 
     assert GLOBAL_SEM is not None
     async with GLOBAL_SEM:
-        try:
-            await update.message.chat.send_action("typing")
-        except Exception:
-            pass
-        data, err, stale_reason = await run_claude_smart(
-            conn, token, scope_cfg, body or "", chat_id, timeout_secs,
+        # A run can take minutes. Telegram's chat action expires after ~5s,
+        # so a single send leaves the chat looking dead for the rest of the
+        # run — indistinguishable from "the bridge never got my message".
+        # Keep it alive, and say so once for genuinely long runs.
+        heartbeat = asyncio.create_task(
+            keepalive(update, timeout_secs)
         )
+        try:
+            data, err, stale_reason = await run_claude_smart(
+                conn, token, scope_cfg, body or "", chat_id, timeout_secs,
+            )
+        finally:
+            heartbeat.cancel()
 
     if err:
         await update.message.reply_text(f"❌ {err}")
@@ -858,6 +928,41 @@ async def dispatch(
 
     result = data.get("result", "") if isinstance(data, dict) else ""
     await reply_long(update, result)
+
+
+async def keepalive(update: Update, timeout_secs: int) -> None:
+    """Hold the "typing" indicator for as long as the run takes.
+
+    Telegram expires a chat action after ~5s, so refresh it. At
+    LONG_RUN_NOTICE_SECS send one plain message too, because the typing dot
+    is easy to miss on mobile and a multi-minute silence reads as failure.
+    Cancelled by the caller when the run finishes; never raises.
+    """
+    elapsed = 0
+    noticed = False
+    try:
+        while True:
+            try:
+                await update.message.chat.send_action("typing")
+            except Exception:
+                pass  # transient Telegram error must not kill the run
+            await asyncio.sleep(KEEPALIVE_INTERVAL_SECS)
+            elapsed += KEEPALIVE_INTERVAL_SECS
+            if (
+                not noticed
+                and LONG_RUN_NOTICE_SECS > 0
+                and elapsed >= LONG_RUN_NOTICE_SECS
+            ):
+                noticed = True
+                try:
+                    await update.message.reply_text(
+                        f"⏳ Still working ({elapsed}s in) — will reply when "
+                        f"done, or time out at {timeout_secs}s."
+                    )
+                except Exception:
+                    pass
+    except asyncio.CancelledError:
+        return
 
 
 async def log_inbound_update(
