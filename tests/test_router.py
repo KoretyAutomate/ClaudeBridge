@@ -186,6 +186,53 @@ class TestSessions(unittest.TestCase):
         ).fetchone()
         self.assertEqual("u1", archived[0])
 
+    def _age_session(self, chat_id: int, scope: str, secs: int) -> None:
+        """Backdate updated_at so the row looks `secs` seconds idle."""
+        old = (datetime.utcnow() - timedelta(seconds=secs)).isoformat()
+        self.conn.execute(
+            "UPDATE sessions SET updated_at=? WHERE chat_id=? AND scope=?",
+            (old, chat_id, scope),
+        )
+        self.conn.commit()
+
+    def test_fresh_session_is_not_stale(self) -> None:
+        bridge.upsert_session(self.conn, 42, "thincart", "u1")
+        self.assertFalse(
+            bridge.is_session_stale(self.conn, 42, "thincart", 43200)
+        )
+
+    def test_idle_session_past_ttl_is_stale(self) -> None:
+        # The real bug: a thread minted for last week's report resumed a week
+        # later, so a bare "approve" landed in the wrong conversation.
+        bridge.upsert_session(self.conn, 42, "thincart", "u1")
+        self._age_session(42, "thincart", 7 * 24 * 3600)
+        self.assertTrue(
+            bridge.is_session_stale(self.conn, 42, "thincart", 43200)
+        )
+
+    def test_ttl_zero_disables_expiry(self) -> None:
+        bridge.upsert_session(self.conn, 42, "thincart", "u1")
+        self._age_session(42, "thincart", 365 * 24 * 3600)
+        self.assertFalse(
+            bridge.is_session_stale(self.conn, 42, "thincart", 0)
+        )
+
+    def test_stale_check_tolerates_missing_and_bad_rows(self) -> None:
+        # No row at all.
+        self.assertFalse(
+            bridge.is_session_stale(self.conn, 42, "thincart", 43200)
+        )
+        # Unparseable timestamp must not raise — treat as not stale.
+        bridge.upsert_session(self.conn, 42, "thincart", "u1")
+        self.conn.execute(
+            "UPDATE sessions SET updated_at='not-a-date' "
+            "WHERE chat_id=42 AND scope='thincart'"
+        )
+        self.conn.commit()
+        self.assertFalse(
+            bridge.is_session_stale(self.conn, 42, "thincart", 43200)
+        )
+
     def test_resume_failure_heuristic(self) -> None:
         self.assertTrue(bridge._is_resume_failure(
             "claude exited 1: Error: session not found"

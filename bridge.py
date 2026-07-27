@@ -49,6 +49,11 @@ IDEAS_DIR = PROJECT_ROOT / "_ideas"
 # Populated from config.yaml — scopes that never auto-stick.
 NEVER_STICKY: set[str] = set()
 
+# Age a (chat × scope) thread out after this long without use. Resuming an
+# old thread makes a short reply like "approve" land in whatever the previous
+# conversation was about instead of the current one. 0 disables expiry.
+SESSION_TTL_SECS: int = 43200  # 12h
+
 # Global deny patterns applied on every claude -p call. Stacks on top of
 # whatever is in ~/.claude/settings.json (deny > ask > allow precedence).
 EXTRA_DISALLOWED_TOOLS = [
@@ -81,14 +86,16 @@ def setup_logging() -> None:
 
 
 def load_yaml_config() -> None:
-    global CFG, NEVER_STICKY
+    global CFG, NEVER_STICKY, SESSION_TTL_SECS
     with open(CONFIG_PATH) as f:
         CFG = yaml.safe_load(f)
     NEVER_STICKY = set(CFG.get("never_sticky", []))
+    SESSION_TTL_SECS = int(CFG.get("session_ttl_secs", SESSION_TTL_SECS))
     log.info(
-        "config.loaded prefixes=%s never_sticky=%s",
+        "config.loaded prefixes=%s never_sticky=%s session_ttl_secs=%s",
         list(CFG.get("prefixes", {}).keys()),
         sorted(NEVER_STICKY),
+        SESSION_TTL_SECS,
     )
 
 
@@ -269,6 +276,30 @@ def get_existing_uuid(
     return row[0] if row else None
 
 
+def is_session_stale(
+    conn: sqlite3.Connection, chat_id: int, scope: str, ttl_secs: int,
+) -> bool:
+    """True if the stored (chat × scope) thread is older than ttl_secs.
+
+    updated_at is written as naive UTC by upsert_session, so compare against
+    utcnow(). A ttl of 0 (or an unparseable timestamp) means never expire.
+    """
+    if ttl_secs <= 0:
+        return False
+    row = conn.execute(
+        "SELECT updated_at FROM sessions "
+        "WHERE chat_id=? AND scope=? AND used_count > 0",
+        (chat_id, scope),
+    ).fetchone()
+    if not row or not row[0]:
+        return False
+    try:
+        last_used = datetime.fromisoformat(row[0])
+    except (TypeError, ValueError):
+        return False
+    return (datetime.utcnow() - last_used).total_seconds() > ttl_secs
+
+
 def upsert_session(
     conn: sqlite3.Connection, chat_id: int, scope: str, session_uuid: str,
 ) -> None:
@@ -422,13 +453,27 @@ def _is_resume_failure(err: str) -> bool:
 async def run_claude_smart(
     conn: sqlite3.Connection, scope: str, scope_cfg: dict, prompt: str,
     chat_id: int, timeout_secs: int,
-) -> tuple[dict | None, str | None, bool]:
+) -> tuple[dict | None, str | None, str | None]:
     """Run claude -p with auto resume-or-fresh logic.
 
-    Returns (data, err, archived_stale). `archived_stale` is True when a
-    stored UUID was found dead and a fresh session was started in its place.
+    Returns (data, err, stale_reason). `stale_reason` is "expired" when the
+    stored thread aged out of SESSION_TTL_SECS, "gone" when the resume target
+    no longer existed, and None when the thread was resumed normally.
     """
     existing = get_existing_uuid(conn, chat_id, scope)
+
+    # Age out an idle thread before resuming it — a short reply like "approve"
+    # must not be interpreted against last week's conversation.
+    if existing and is_session_stale(conn, chat_id, scope, SESSION_TTL_SECS):
+        log.info(
+            "session.expired chat=%s scope=%s uuid=%s ttl=%ss — starting fresh",
+            chat_id, scope, existing, SESSION_TTL_SECS,
+        )
+        archive_uuid(conn, chat_id, scope, existing)
+        data, err = await _spawn_claude(
+            scope, scope_cfg, prompt, [], timeout_secs,
+        )
+        return data, err, "expired"
 
     # Try resume first if we have one.
     if existing:
@@ -436,10 +481,10 @@ async def run_claude_smart(
             scope, scope_cfg, prompt, ["--resume", existing], timeout_secs,
         )
         if err is None:
-            return data, None, False
+            return data, None, None
         if not _is_resume_failure(err):
             # Real failure — surface it; don't silently retry.
-            return None, err, False
+            return None, err, None
         # Resume target is gone — archive and fall through to fresh.
         log.warning(
             "resume.stale chat=%s scope=%s uuid=%s — archiving and starting fresh",
@@ -451,7 +496,7 @@ async def run_claude_smart(
     data, err = await _spawn_claude(
         scope, scope_cfg, prompt, [], timeout_secs,
     )
-    return data, err, existing is not None
+    return data, err, "gone" if existing else None
 
 
 # ============================== Telegram I/O ==============================
@@ -773,7 +818,7 @@ async def dispatch(
             await update.message.chat.send_action("typing")
         except Exception:
             pass
-        data, err, archived_stale = await run_claude_smart(
+        data, err, stale_reason = await run_claude_smart(
             conn, token, scope_cfg, body or "", chat_id, timeout_secs,
         )
 
@@ -781,7 +826,12 @@ async def dispatch(
         await update.message.reply_text(f"❌ {err}")
         return
 
-    if archived_stale:
+    if stale_reason == "expired":
+        await update.message.reply_text(
+            f"(Previous thread for /{token} was idle too long; "
+            f"started fresh — this message was read without that history.)"
+        )
+    elif stale_reason == "gone":
         await update.message.reply_text(
             f"(Previous thread for /{token} was gone; starting fresh.)"
         )
