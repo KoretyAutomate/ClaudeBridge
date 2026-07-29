@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -246,7 +246,7 @@ class TestSessions(unittest.TestCase):
         self.assertFalse(bridge.is_session_stale(self.conn, 42, "thincart", 43200))
 
     def test_message_age_fresh_and_stale(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.assertLess(bridge.message_age_secs(now), 5)
         old = now - timedelta(seconds=3600)
         self.assertAlmostEqual(3600, bridge.message_age_secs(old), delta=5)

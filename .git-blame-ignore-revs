@@ -1,0 +1,10 @@
+# Revisions to skip in `git blame` — bulk reformats and other mechanical,
+# tree-wide rewrites that carry no authorship meaning.
+#
+# Honored automatically by GitHub. Locally it needs (set in this repo's config):
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Only add commits that provably change no behavior.
+
+# style: apply ruff format across the tree (2026-07-29)
+050610b45bd53397990e22c3f43ee58ca4dada1d

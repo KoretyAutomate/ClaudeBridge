@@ -11,7 +11,7 @@ import asyncio
 import logging
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
 from telegram import Chat, Message, Update, User
@@ -32,7 +32,7 @@ EDIT_FILTER = filters.ChatType.PRIVATE & filters.TEXT & filters.UpdateType.EDITE
 def _msg(text: str, *, age_secs: int = 0) -> Message:
     user = User(id=CHAT_ID, first_name="K", is_bot=False)
     chat = Chat(id=CHAT_ID, type=Chat.PRIVATE)
-    when = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
+    when = datetime.now(UTC) - timedelta(seconds=age_secs)
     m = Message(
         message_id=1,
         date=when,

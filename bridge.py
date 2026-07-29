@@ -7,6 +7,7 @@ Single-user. See PLAN.md for architecture, security model, and decisions.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import io
 import json
@@ -16,7 +17,6 @@ import os
 import re
 import socket
 import sqlite3
-import sys
 import time
 import uuid as uuid_mod
 from datetime import date, datetime
@@ -447,7 +447,7 @@ async def _spawn_claude(
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         log.warning("claude.timeout scope=%s", scope)
@@ -625,10 +625,10 @@ def _is_table_separator(line: str) -> bool:
 
 def _has_markdown_tables(text: str) -> bool:
     lines = text.split("\n")
-    for i in range(len(lines) - 1):
-        if "|" in lines[i] and _is_table_separator(lines[i + 1]):
-            return True
-    return False
+    return any(
+        "|" in lines[i] and _is_table_separator(lines[i + 1])
+        for i in range(len(lines) - 1)
+    )
 
 
 def _md_inline_to_html(s: str) -> str:
@@ -667,7 +667,7 @@ def _format_table_as_cards(table_lines: list[str]) -> str:
         if not any(cell for cell in row):
             continue
         card_lines = []
-        for h, cell in zip(headers, row):
+        for h, cell in zip(headers, row, strict=False):  # ragged rows are tolerated
             label = html.escape(h.strip().strip("*").strip())
             value = _md_inline_to_html(cell) if cell else "—"
             card_lines.append(f"<b>{label}</b>: {value}")
@@ -753,9 +753,7 @@ def authz(update: Update) -> bool:
         return False
     if update.effective_chat.id != update.effective_user.id:
         return False
-    if update.message is None or update.message.text is None:
-        return False
-    return True
+    return update.message is not None and update.message.text is not None
 
 
 # ============================== Verbs ==============================
@@ -910,7 +908,8 @@ async def dispatch(
 
     timeout_secs = int(os.environ.get("BRIDGE_TIMEOUT_SECS", CFG.get("timeout_secs", 600)))
 
-    assert GLOBAL_SEM is not None
+    if GLOBAL_SEM is None:  # not an assert: `python -O` strips those
+        raise RuntimeError("GLOBAL_SEM not initialised — call setup() first")
     async with GLOBAL_SEM:
         # A run can take minutes. Telegram's chat action expires after ~5s,
         # so a single send leaves the chat looking dead for the rest of the
@@ -965,20 +964,17 @@ async def keepalive(update: Update, timeout_secs: int) -> None:
     noticed = False
     try:
         while True:
-            try:
+            # transient Telegram error must not kill the run
+            with contextlib.suppress(Exception):
                 await update.message.chat.send_action("typing")
-            except Exception:
-                pass  # transient Telegram error must not kill the run
             await asyncio.sleep(KEEPALIVE_INTERVAL_SECS)
             elapsed += KEEPALIVE_INTERVAL_SECS
             if not noticed and LONG_RUN_NOTICE_SECS > 0 and elapsed >= LONG_RUN_NOTICE_SECS:
                 noticed = True
-                try:
+                with contextlib.suppress(Exception):  # notice is best-effort
                     await update.message.reply_text(
                         f"⏳ Still working ({elapsed}s in) — will reply when done, or time out at {timeout_secs}s."
                     )
-                except Exception:
-                    pass
     except asyncio.CancelledError:
         return
 
@@ -1184,10 +1180,8 @@ def main() -> None:
         task = app.bot_data.get("idle_sweep_task")
         if task and not task.done():
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
     app = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
     app.bot_data["conn"] = conn
