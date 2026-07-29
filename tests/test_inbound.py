@@ -4,6 +4,7 @@ Covers the handler wiring that made a missing reply undiagnosable: every
 update must hit the group -1 logger, and an edited message must reach the
 edit handler rather than the main chokepoint.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -24,14 +25,8 @@ CHAT_ID = 4242
 
 # The exact filter expressions main() registers. Kept as module constants so
 # a change to one in bridge.py without the other shows up as a failure here.
-MAIN_FILTER = (
-    filters.ChatType.PRIVATE & filters.TEXT
-    & ~filters.UpdateType.EDITED_MESSAGE
-)
-EDIT_FILTER = (
-    filters.ChatType.PRIVATE & filters.TEXT
-    & filters.UpdateType.EDITED_MESSAGE
-)
+MAIN_FILTER = filters.ChatType.PRIVATE & filters.TEXT & ~filters.UpdateType.EDITED_MESSAGE
+EDIT_FILTER = filters.ChatType.PRIVATE & filters.TEXT & filters.UpdateType.EDITED_MESSAGE
 
 
 def _msg(text: str, *, age_secs: int = 0) -> Message:
@@ -39,7 +34,11 @@ def _msg(text: str, *, age_secs: int = 0) -> Message:
     chat = Chat(id=CHAT_ID, type=Chat.PRIVATE)
     when = datetime.now(timezone.utc) - timedelta(seconds=age_secs)
     m = Message(
-        message_id=1, date=when, chat=chat, from_user=user, text=text,
+        message_id=1,
+        date=when,
+        chat=chat,
+        from_user=user,
+        text=text,
     )
     m.set_bot(None)  # never used; keeps Message from needing a live bot
     return m
@@ -154,6 +153,7 @@ class TestKeepalive(unittest.TestCase):
             await asyncio.sleep(for_secs)
             t.cancel()
             await t  # must return cleanly, not raise CancelledError out
+
         asyncio.run(go())
 
     def test_refreshes_typing_repeatedly(self) -> None:
