@@ -94,15 +94,27 @@ PER_CHAT_LOCKS: dict[int, asyncio.Lock] = {}
 # ============================== Setup ==============================
 
 
+class RedactingFormatter(logging.Formatter):
+    """Masks Telegram bot tokens, which httpx embeds in every request URL."""
+
+    TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]{30,}")
+
+    def format(self, record: logging.LogRecord) -> str:
+        return self.TOKEN_RE.sub("bot<redacted>", super().format(record))
+
+
 def setup_logging() -> None:
     STATE_DIR.mkdir(mode=0o700, exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    fmt = RedactingFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     fh = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=5)
     fh.setFormatter(fmt)
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     level = os.environ.get("BRIDGE_LOG_LEVEL", "INFO")
     logging.basicConfig(level=level, handlers=[fh, sh])
+    # httpx logs one INFO line per getUpdates poll (every ~10s), URL and all.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def load_yaml_config() -> None:
