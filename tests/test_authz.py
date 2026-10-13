@@ -1,4 +1,5 @@
 """Auth chokepoint tests."""
+
 from __future__ import annotations
 
 import sys
@@ -27,7 +28,6 @@ def make_update(*, user_id, chat_id, chat_type=PRIVATE, text="hi"):
 
 
 class TestAuthz(unittest.TestCase):
-
     def setUp(self) -> None:
         bridge.ALLOWED_USER_IDS = {12345}
 

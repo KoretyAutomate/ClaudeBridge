@@ -1,0 +1,65 @@
+# CANONICAL lint contract — the fallback for any repo without its own ruff.toml.
+#
+# A repo with no ruff.toml is linted against THIS file in ADVISORY mode (warns,
+# never blocks). Copy it into the repo and drain the backlog to zero to make it
+# blocking — that is the ratchet, per the article: warn first, error once clean.
+#
+# Limits mirror §② of
+# https://zenn.dev/singularity/articles/stopped-reviewing-my-code,
+# translated from ESLint to ruff:
+#
+#   max-lines-per-function: 60  ->  PLR0915 max-statements
+#   complexity: 20              ->  C901    max-complexity
+#   max-depth: 4                ->  PLR1702 max-nested-blocks
+#   max-params: 6               ->  PLR0913 max-args
+#
+# House rule carried over verbatim from the article: exceptions live HERE,
+# in config, with a reason. Never an inline `# noqa` — an inline suppression
+# is invisible to everyone who didn't already open that file.
+
+line-length = 120
+target-version = "py311"
+exclude = [
+    ".git", "__pycache__", ".venv", "venv", "node_modules",
+    "build", "dist", "output", "data", "archive",
+]
+
+[lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "B",        # flake8-bugbear
+    "S",        # flake8-bandit (security)
+    "SIM",      # flake8-simplify
+    "UP",       # pyupgrade
+    "C901",     # mccabe complexity
+    "PLR0913",  # too-many-arguments
+    "PLR0915",  # too-many-statements
+    # PLR1702 (too-many-nested-blocks, the `max-depth: 4` analogue) is
+    # deliberately NOT selected: it is preview-only in ruff 0.16, and listing
+    # it emits "has no effect because preview is not enabled" while silently
+    # enforcing nothing. Enabling `preview = true` to get it would also switch
+    # on every other unstable rule. Revisit when it stabilises; the
+    # max-nested-blocks value below is kept ready for that day.
+]
+
+[lint.mccabe]
+max-complexity = 20
+
+[lint.pylint]
+max-args = 6
+max-statements = 60
+max-nested-blocks = 4
+
+[lint.per-file-ignores]
+# pytest's bare `assert` IS the idiom — S101 would fire on every test.
+# Fixture passwords/tmp paths/magic numbers are fixtures, not findings.
+"tests/**" = ["S101", "S106", "S108", "PLR2004"]
+"**/test_*.py" = ["S101", "S106", "S108", "PLR2004"]
+# One-shot maintenance scripts: loose structure is acceptable by design.
+"scripts/**" = ["S101"]
+# S105 in bridge.py: the local `token` holds a parsed COMMAND word compared
+# against slash-verbs ("/help", "/list", "/status", "/new") — not a credential.
+# The remaining site compares TELEGRAM_BOT_TOKEN against the placeholder
+# "PUT_BOT_TOKEN_HERE", i.e. it is the check that the secret was NOT left unset.
+"bridge.py" = ["S105"]

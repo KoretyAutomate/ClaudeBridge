@@ -1,10 +1,11 @@
 """Router resolution tests. No network, no subprocess."""
+
 from __future__ import annotations
 
 import sqlite3
 import sys
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -17,18 +18,18 @@ def _setup_cfg() -> None:
         "default_scope": "idea",
         "never_sticky": ["trading", "podcast"],
         "prefixes": {
-            "idea": {"cwd": "/tmp/_ideas", "model": "sonnet",
-                     "allowed_tools": ["Read"]},
-            "podcast": {"cwd": "/tmp/podcast", "model": "opus",
-                        "allowed_tools": ["Read", "Edit"]},
-            "trading": {"cwd": "/tmp/trading", "model": "sonnet",
-                        "allowed_tools": ["Read"]},
-            "screener": {"cwd": "/tmp/screener", "model": "sonnet",
-                         "allowed_tools": ["Read", "Edit"]},
+            "idea": {"cwd": "/tmp/_ideas", "model": "sonnet", "allowed_tools": ["Read"]},
+            "podcast": {"cwd": "/tmp/podcast", "model": "opus", "allowed_tools": ["Read", "Edit"]},
+            "trading": {"cwd": "/tmp/trading", "model": "sonnet", "allowed_tools": ["Read"]},
+            "screener": {"cwd": "/tmp/screener", "model": "sonnet", "allowed_tools": ["Read", "Edit"]},
         },
         "verbs": {
-            "/help": "h", "/list": "l", "/status": "s",
-            "/new": "n", "/reset": "n", "/scaffold": "sc",
+            "/help": "h",
+            "/list": "l",
+            "/status": "s",
+            "/new": "n",
+            "/reset": "n",
+            "/scaffold": "sc",
         },
     }
     bridge.NEVER_STICKY = set(bridge.CFG["never_sticky"])
@@ -55,7 +56,6 @@ def _conn() -> sqlite3.Connection:
 
 
 class TestRouter(unittest.TestCase):
-
     def setUp(self) -> None:
         _setup_cfg()
         self.conn = _conn()
@@ -72,8 +72,7 @@ class TestRouter(unittest.TestCase):
 
     def test_prefix_with_body(self) -> None:
         token, body, kind = bridge.resolve("/podcast write ep5", 1, self.conn)
-        self.assertEqual(("podcast", "write ep5", "route"),
-                         (token, body, kind))
+        self.assertEqual(("podcast", "write ep5", "route"), (token, body, kind))
 
     def test_bare_prefix_is_switch(self) -> None:
         token, body, kind = bridge.resolve("/screener", 1, self.conn)
@@ -98,8 +97,7 @@ class TestRouter(unittest.TestCase):
         # Force a sticky write of trading scope (bypassing the guard) to
         # verify resolve() ignores it.
         self.conn.execute(
-            "INSERT INTO chat_state (chat_id, sticky_scope, sticky_set_at) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO chat_state (chat_id, sticky_scope, sticky_set_at) VALUES (?, ?, ?)",
             (1, "trading", datetime.utcnow().isoformat()),
         )
         self.conn.commit()
@@ -108,8 +106,7 @@ class TestRouter(unittest.TestCase):
 
     def test_podcast_never_sticks(self) -> None:
         self.conn.execute(
-            "INSERT INTO chat_state (chat_id, sticky_scope, sticky_set_at) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO chat_state (chat_id, sticky_scope, sticky_set_at) VALUES (?, ?, ?)",
             (1, "podcast", datetime.utcnow().isoformat()),
         )
         self.conn.commit()
@@ -119,8 +116,7 @@ class TestRouter(unittest.TestCase):
     def test_sticky_expires_after_24h(self) -> None:
         long_ago = (datetime.utcnow() - timedelta(hours=25)).isoformat()
         self.conn.execute(
-            "INSERT INTO chat_state (chat_id, sticky_scope, sticky_set_at) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO chat_state (chat_id, sticky_scope, sticky_set_at) VALUES (?, ?, ?)",
             (1, "screener", long_ago),
         )
         self.conn.commit()
@@ -136,8 +132,44 @@ class TestRouter(unittest.TestCase):
         self.assertFalse(bridge.SCAFFOLD_NAME_RE.match("a" * 33))
 
 
-class TestSessions(unittest.TestCase):
+class TestFailureExplain(unittest.TestCase):
+    """A failed run must report why, not dump raw JSON at the user."""
 
+    def setUp(self) -> None:
+        _setup_cfg()
+        bridge.CFG["max_budget_usd_per_call"] = 2.0
+
+    def test_budget_cap_is_named_explicitly(self) -> None:
+        # Verbatim shape of the real 2026-07-26 era failure.
+        blob = (
+            '{"is_error":true,"duration_api_ms":155019,"num_turns":3,'
+            '"stop_reason":"tool_use","total_cost_usd":2.08628415}'
+        )
+        out = bridge.explain_failure_json(blob)
+        self.assertIsNotNone(out)
+        self.assertIn("budget cap", out)
+        self.assertIn("$2.09", out)
+        self.assertIn("max_budget_usd_per_call", out)
+
+    def test_cost_just_under_cap_still_counts_as_budget(self) -> None:
+        # Claude can stop a hair under the cap; don't misreport that.
+        blob = '{"is_error":true,"total_cost_usd":1.995,"num_turns":2}'
+        self.assertIn("budget cap", bridge.explain_failure_json(blob))
+
+    def test_non_budget_error_reports_its_own_detail(self) -> None:
+        blob = '{"is_error":true,"result":"tool denied","total_cost_usd":0.1}'
+        out = bridge.explain_failure_json(blob)
+        self.assertIn("tool denied", out)
+        self.assertNotIn("budget cap", out)
+
+    def test_returns_none_for_success_and_non_json(self) -> None:
+        self.assertIsNone(bridge.explain_failure_json('{"is_error":false,"result":"ok"}'))
+        self.assertIsNone(bridge.explain_failure_json("plain stderr text"))
+        self.assertIsNone(bridge.explain_failure_json("{not valid json"))
+        self.assertIsNone(bridge.explain_failure_json(""))
+
+
+class TestSessions(unittest.TestCase):
     def setUp(self) -> None:
         _setup_cfg()
         self.conn = _conn()
@@ -147,8 +179,7 @@ class TestSessions(unittest.TestCase):
         self.assertIsNone(bridge.get_existing_uuid(self.conn, 42, "podcast"))
         # Row with used_count=0 (e.g. just-migrated stale entry) is also None.
         self.conn.execute(
-            "INSERT INTO sessions (chat_id, scope, session_uuid, used_count) "
-            "VALUES (42, 'podcast', 'stale-uuid', 0)"
+            "INSERT INTO sessions (chat_id, scope, session_uuid, used_count) VALUES (42, 'podcast', 'stale-uuid', 0)"
         )
         self.assertIsNone(bridge.get_existing_uuid(self.conn, 42, "podcast"))
 
@@ -164,38 +195,72 @@ class TestSessions(unittest.TestCase):
             "new-uuid",
             bridge.get_existing_uuid(self.conn, 42, "podcast"),
         )
-        used = self.conn.execute(
-            "SELECT used_count FROM sessions WHERE chat_id=42 AND scope='podcast'"
-        ).fetchone()[0]
+        used = self.conn.execute("SELECT used_count FROM sessions WHERE chat_id=42 AND scope='podcast'").fetchone()[0]
         self.assertEqual(2, used)
 
     def test_per_chat_per_scope_isolated(self) -> None:
         bridge.upsert_session(self.conn, 42, "podcast", "u-podcast")
         bridge.upsert_session(self.conn, 42, "trading", "u-trading")
-        self.assertEqual("u-podcast",
-                         bridge.get_existing_uuid(self.conn, 42, "podcast"))
-        self.assertEqual("u-trading",
-                         bridge.get_existing_uuid(self.conn, 42, "trading"))
+        self.assertEqual("u-podcast", bridge.get_existing_uuid(self.conn, 42, "podcast"))
+        self.assertEqual("u-trading", bridge.get_existing_uuid(self.conn, 42, "trading"))
 
     def test_archive_uuid_deletes_active_row(self) -> None:
         bridge.upsert_session(self.conn, 42, "podcast", "u1")
         bridge.archive_uuid(self.conn, 42, "podcast", "u1")
         self.assertIsNone(bridge.get_existing_uuid(self.conn, 42, "podcast"))
-        archived = self.conn.execute(
-            "SELECT session_uuid FROM sessions_archive WHERE chat_id=42"
-        ).fetchone()
+        archived = self.conn.execute("SELECT session_uuid FROM sessions_archive WHERE chat_id=42").fetchone()
         self.assertEqual("u1", archived[0])
 
+    def _age_session(self, chat_id: int, scope: str, secs: int) -> None:
+        """Backdate updated_at so the row looks `secs` seconds idle."""
+        old = (datetime.utcnow() - timedelta(seconds=secs)).isoformat()
+        self.conn.execute(
+            "UPDATE sessions SET updated_at=? WHERE chat_id=? AND scope=?",
+            (old, chat_id, scope),
+        )
+        self.conn.commit()
+
+    def test_fresh_session_is_not_stale(self) -> None:
+        bridge.upsert_session(self.conn, 42, "thincart", "u1")
+        self.assertFalse(bridge.is_session_stale(self.conn, 42, "thincart", 43200))
+
+    def test_idle_session_past_ttl_is_stale(self) -> None:
+        # The real bug: a thread minted for last week's report resumed a week
+        # later, so a bare "approve" landed in the wrong conversation.
+        bridge.upsert_session(self.conn, 42, "thincart", "u1")
+        self._age_session(42, "thincart", 7 * 24 * 3600)
+        self.assertTrue(bridge.is_session_stale(self.conn, 42, "thincart", 43200))
+
+    def test_ttl_zero_disables_expiry(self) -> None:
+        bridge.upsert_session(self.conn, 42, "thincart", "u1")
+        self._age_session(42, "thincart", 365 * 24 * 3600)
+        self.assertFalse(bridge.is_session_stale(self.conn, 42, "thincart", 0))
+
+    def test_stale_check_tolerates_missing_and_bad_rows(self) -> None:
+        # No row at all.
+        self.assertFalse(bridge.is_session_stale(self.conn, 42, "thincart", 43200))
+        # Unparseable timestamp must not raise — treat as not stale.
+        bridge.upsert_session(self.conn, 42, "thincart", "u1")
+        self.conn.execute("UPDATE sessions SET updated_at='not-a-date' WHERE chat_id=42 AND scope='thincart'")
+        self.conn.commit()
+        self.assertFalse(bridge.is_session_stale(self.conn, 42, "thincart", 43200))
+
+    def test_message_age_fresh_and_stale(self) -> None:
+        now = datetime.now(UTC)
+        self.assertLess(bridge.message_age_secs(now), 5)
+        old = now - timedelta(seconds=3600)
+        self.assertAlmostEqual(3600, bridge.message_age_secs(old), delta=5)
+
+    def test_message_age_none_when_undeterminable(self) -> None:
+        # Missing stamp, and naive stamp (no tzinfo) — both mean "treat as
+        # current" rather than reject on a bad clock.
+        self.assertIsNone(bridge.message_age_secs(None))
+        self.assertIsNone(bridge.message_age_secs(datetime.utcnow()))
+
     def test_resume_failure_heuristic(self) -> None:
-        self.assertTrue(bridge._is_resume_failure(
-            "claude exited 1: Error: session not found"
-        ))
-        self.assertTrue(bridge._is_resume_failure(
-            "could not find session 'xyz'"
-        ))
-        self.assertFalse(bridge._is_resume_failure(
-            "claude exited 1: Error: rate limited"
-        ))
+        self.assertTrue(bridge._is_resume_failure("claude exited 1: Error: session not found"))
+        self.assertTrue(bridge._is_resume_failure("could not find session 'xyz'"))
+        self.assertFalse(bridge._is_resume_failure("claude exited 1: Error: rate limited"))
         self.assertFalse(bridge._is_resume_failure(""))
 
     def test_daily_cost_accumulates(self) -> None:
@@ -206,7 +271,6 @@ class TestSessions(unittest.TestCase):
 
 
 class TestTableFormatter(unittest.TestCase):
-
     def test_separator_detection(self) -> None:
         self.assertTrue(bridge._is_table_separator("|---|---|"))
         self.assertTrue(bridge._is_table_separator("| --- | :---: | ---: |"))

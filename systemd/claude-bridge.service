@@ -1,16 +1,30 @@
 [Unit]
 Description=ClaudeBridge — Telegram dispatcher to claude -p
+# network-online.target is a SYSTEM target: a user unit cannot order itself after
+# it, so these two lines wait for nothing. The real wait is ExecStartPre below.
 Wants=network-online.target nss-lookup.target
 After=network-online.target nss-lookup.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# Never give up. The old limit (5 starts in 300 s, 10 s apart) was spent in about a
+# minute on 2026-10-12, while DNS took ~1.5 min after boot, and the bridge stayed
+# down for 16 h. A crash loop is slowed by RestartSteps below instead; a bad
+# config still stops it for good via exit 78.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=%h/Project/ClaudeBridge
+# Wait until Telegram's name resolves: at boot the service starts before DNS is
+# up, and the bot exits on its first failed lookup. Bounded by TimeoutStartSec;
+# a timeout is a failure, so Restart= tries again.
+ExecStartPre=/bin/sh -c 'until getent hosts api.telegram.org >/dev/null; do sleep 2; done'
+TimeoutStartSec=180
 ExecStart=%h/miniconda3/envs/claude_bridge/bin/python %h/Project/ClaudeBridge/bridge.py
 Restart=on-failure
 RestartSec=10
+# Back off 10 s → 5 min over 10 restarts, so a long outage costs a retry every
+# few minutes rather than every 10 seconds.
+RestartSteps=10
+RestartMaxDelaySec=300
 RestartPreventExitStatus=78
 KillSignal=SIGINT
 TimeoutStopSec=30
